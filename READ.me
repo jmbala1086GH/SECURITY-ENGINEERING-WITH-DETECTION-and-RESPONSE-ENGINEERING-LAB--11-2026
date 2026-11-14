@@ -1,0 +1,117 @@
+# Automated Brute-Force Detection & Active Response with Wazuh SIEM
+
+![SIEM](https://shields.io)
+![Target](https://shields.io)
+![Attacker](https://shields.io)
+![Framework](https://shields.io)
+
+## Project Overview
+
+This repository documents an end-to-end Security Operations Center (SOC) detection engineering and automated incident response lab. Using a three-node virtualized environment, an automated HTTP POST credential brute-force attack was launched against a containerized web application, analyzed through raw server error telemetry, detected via custom correlation rules in **Wazuh SIEM**, and automatically contained using **Wazuh Active Response (`firewall-drop`)**.
+
+📄 **[Read the Full 40-Page Technical Lab Report (PDF)](./report/Wazuh-DVWA-Brute-Force-Detection-Report.pdf)**
+
+---
+
+## Lab Architecture
+
+| Role | Operating System / Platform | Hostname | IP Address | Key Services |
+| :--- | :--- | :--- | :--- | :--- |
+| **Attacker VM** | Kali Linux | `kali` | `192.168.140.148` | Automated HTTP POST brute-force scripts |
+| **Target VM** | Ubuntu Server | `jeanpubuntu` | `192.168.140.150` | Docker (`vigilant_hermann` / DVWA on Port 80), Wazuh Agent |
+| **SIEM Server** | Ubuntu / Wazuh Manager | `wazuh-server` | `192.168.140.151` | Wazuh Manager, Indexer, Dashboard |
+
+### Telemetry & Response Flow
+1. **Attack Simulation:** Kali Linux (`192.168.140.148`) sends high-frequency automated HTTP POST requests to `http://192.168.140`.
+2. **Log Generation & Decoding:** Apache logs recurring PHP notices (`Undefined index: session_token in /var/www/html/login.php`), parsed by Wazuh's `apache-errorlog` decoder under base **Rule `30318`**.
+3. **Custom Detection & Correlation:** Custom rules in `/var/ossec/etc/rules/local_rules.xml` filter `login.php` anomalies (**Rule `100010`**) and correlate bursts of **8+ attempts within 30 seconds** from the same source IP (**Rule `100011`**).
+4. **Automated Containment:** Triggering **Rule `100011`** invokes Wazuh Active Response (`firewall-drop`), dynamically inserting an `iptables` `DROP` rule on `jeanpubuntu` for **120 seconds** (**Rule `651`**) before automatically restoring network access.
+
+---
+
+## Repository Structure
+
+```text
+wazuh-dvwa-bruteforce-detection/
+├── README.md
+├── detections/
+│   └── local_rules.xml                       # Custom Wazuh detection & correlation rules (100010, 100011)
+├── configs/
+│   └── ossec-active-response.xml             # Wazuh Manager Active Response configuration snippet
+├── screenshots/
+│   ├── 01-wazuh-rule-100011-alert.png        # High-severity alert & MITRE T1110.001 mapping
+│   └── 02-active-response-rule-651.png       # Automated firewall-drop containment confirmation
+└── report/
+    └── Wazuh-DVWA-Brute-Force-Detection-Report.pdf
+```
+
+---
+
+## Detection Engineering & Configuration
+
+### 1. Custom Correlation Rules (`detections/local_rules.xml`)
+To eliminate alert noise from isolated user errors while catching automated credential stuffing/brute-force bursts, a two-tier rule hierarchy was deployed:
+* **Rule `100010` (Level 6):** Child of Rule `30318`; isolates anomalous authentication requests targeting `login.php`.
+* **Rule `100011` (Level 12):** Frequency-based correlation rule (`frequency="8"`, `timeframe="30"`, `<same_srcip />`) mapped to **MITRE ATT&CK `T1110.001`**.
+
+*(See full XML implementation in [`./detections/local_rules.xml`](./detections/local_rules.xml))*
+
+### 2. Automated Containment (`configs/ossec-active-response.xml`)
+Configured in `/var/ossec/etc/ossec.conf` on `wazuh-server` to execute `firewall-drop` locally on the targeted endpoint (`location="local"`) whenever Rule `100011` fires, enforcing a 120-second network block (`timeout="120"`).
+
+*(See configuration snippet in [`./configs/ossec-active-response.xml`](./configs/ossec-active-response.xml))*
+
+---
+
+## Verification & Validation Commands
+
+The following commands were used during lab execution to validate rule syntax, monitor real-time containment, and inspect active firewall rules on the target host (`jeanpubuntu`):
+
+```bash
+# 1. Validate custom Wazuh rule syntax and restart Wazuh Manager (on wazuh-server)
+sudo /var/ossec/bin/wazuh-analysisd -t
+sudo systemctl restart wazuh-manager
+
+# 2. Monitor Active Response execution (add/delete actions) on Ubuntu Target
+sudo tail -f /var/ossec/logs/active-responses.log
+
+# 3. Inspect dynamic iptables DROP rule during the 120-second containment window
+sudo iptables -L -n -v | grep 192.168.140.148
+```
+
+---
+
+## MITRE ATT&CK & D3FEND Mapping
+
+| Phase / Tactic | Technique ID & Name | Lab Evidence / Artifact | Wazuh Rule / Control |
+| :--- | :--- | :--- | :--- |
+| **Credential Access** | **T1110.001** – Brute Force: Password Guessing | Automated HTTP POST bursts against `http://192.168.140` from `192.168.140.148`. | Base Rule `30318` (`apache-errorlog`) |
+| **Detection (Triage)** | **T1110** – Brute Force (Anomalous Login Activity) | Repeated PHP error entries (`Undefined index: session_token`) parsed from container web logs. | Custom Rule `100010` (Level 6) |
+| **Detection (Correlation)** | **T1110.001** – Brute Force: Password Guessing | Threshold breach: ≥ 8 matching requests within 30s from identical `srcip`. | Custom Rule `100011` (Level 12) |
+| **Containment (Mitigation)** | **D3FEND: D3-ANCI** – Network Traffic Filtering | Dynamic insertion of `DROP` rule for `192.168.140.148` logged in `active-responses.log` (`timeout="120"`). | Active Response (`firewall-drop` / Rule `651`) |
+
+---
+
+## Proof of Concept Screenshots
+
+### High-Severity Brute-Force Detection (Rule `100011` / MITRE `T1110.001`)
+![Wazuh Rule 100011 Alert](./screenshots/01-wazuh-rule-100011-alert.png)
+
+### Automated Host Containment Confirmation (Rule `651` / `firewall-drop`)
+![Wazuh Active Response Rule 651](./screenshots/02-active-response-rule-651.png)
+
+---
+
+## Preventive Hardening Recommendations
+
+While Wazuh Active Response provides rapid reactive containment at the network layer, defense-in-depth requires layered application and host-level controls (detailed in Section 6 of the full PDF report):
+* **Application Hardening:** Transition DVWA from *Low* to *High/Impossible* security levels to enforce strict server-side session validation and input sanitization.
+* **Anti-CSRF Tokens & Rate Limiting:** Require single-use `user_token` validation on login forms alongside progressive back-off delays.
+* **Multi-Factor Authentication (MFA):** Enforce TOTP or FIDO2 authentication on exposed administrative and user portals.
+* **Reverse Proxy / WAF:** Place containerized web applications behind Nginx rate-limiting (`limit_req_zone`) or ModSecurity (OWASP CRS).
+
+---
+
+## Methodology & Tooling Note
+
+All lab architecture, attack simulations, custom Wazuh rule tuning, Active Response configurations, and verification screenshots were executed and validated hands-on within a local virtualized environment. AI assistance was utilized as a technical sounding board for troubleshooting log parsing behavior, refining XML correlation logic, and structuring final report documentation.
